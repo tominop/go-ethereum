@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/swarm/api"
@@ -50,7 +51,7 @@ func ParseURI(h http.Handler) http.Handler {
 		uri, err := api.Parse(strings.TrimLeft(r.URL.Path, "/"))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			RespondError(w, r, fmt.Sprintf("invalid URI %q", r.URL.Path), http.StatusBadRequest)
+			respondError(w, r, fmt.Sprintf("invalid URI %q", r.URL.Path), http.StatusBadRequest)
 			return
 		}
 		if uri.Addr != "" && strings.HasPrefix(uri.Addr, "0x") {
@@ -73,9 +74,13 @@ func ParseURI(h http.Handler) http.Handler {
 
 func InitLoggingResponseWriter(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
+		defer metrics.GetOrRegisterResettingTimer(fmt.Sprintf("http.request.%s.time", r.Method), nil).UpdateSince(startTime)
+
 		writer := newLoggingResponseWriter(w)
 		h.ServeHTTP(writer, r)
-		log.Debug("request served", "ruid", GetRUID(r.Context()), "code", writer.statusCode)
+		log.Info("request served", "ruid", GetRUID(r.Context()), "code", writer.statusCode)
+		metrics.GetOrRegisterResettingTimer(fmt.Sprintf("http.request.%s.%d.time", r.Method, writer.statusCode), nil).UpdateSince(startTime)
 	})
 }
 
