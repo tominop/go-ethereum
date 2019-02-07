@@ -142,10 +142,11 @@ func mget(store ChunkStore, hs []Address, f func(h Address, chunk Chunk) error) 
 		close(errc)
 	}()
 	var err error
+	timeout := 10 * time.Second
 	select {
 	case err = <-errc:
-	case <-time.NewTimer(5 * time.Second).C:
-		err = fmt.Errorf("timed out after 5 seconds")
+	case <-time.NewTimer(timeout).C:
+		err = fmt.Errorf("timed out after %v", timeout)
 	}
 	return err
 }
@@ -179,8 +180,9 @@ func testStoreCorrect(m ChunkStore, n int, chunksize int64, t *testing.T) {
 			return fmt.Errorf("key does not match retrieved chunk Address")
 		}
 		hasher := MakeHashFunc(DefaultHash)()
-		hasher.ResetWithLength(chunk.SpanBytes())
-		hasher.Write(chunk.Payload())
+		data := chunk.Data()
+		hasher.ResetWithLength(data[:8])
+		hasher.Write(data[8:])
 		exp := hasher.Sum(nil)
 		if !bytes.Equal(h, exp) {
 			return fmt.Errorf("key is not hash of chunk data")

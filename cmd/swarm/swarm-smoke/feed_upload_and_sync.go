@@ -3,10 +3,10 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	crand "crypto/rand"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -17,7 +17,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/swarm/storage/feed"
-	colorable "github.com/mattn/go-colorable"
 	"github.com/pborman/uuid"
 	cli "gopkg.in/urfave/cli.v1"
 )
@@ -27,10 +26,7 @@ const (
 )
 
 // TODO: retrieve with manifest + extract repeating code
-func cliFeedUploadAndSync(c *cli.Context) error {
-
-	log.Root().SetHandler(log.CallerFileHandler(log.LvlFilterHandler(log.Lvl(verbosity), log.StreamHandler(colorable.NewColorableStderr(), log.TerminalFormat(true)))))
-
+func feedUploadAndSync(c *cli.Context) error {
 	defer func(now time.Time) { log.Info("total time", "time", time.Since(now), "size (kb)", filesize) }(time.Now())
 
 	generateEndpoints(scheme, cluster, appName, from, to)
@@ -204,12 +200,13 @@ func cliFeedUploadAndSync(c *cli.Context) error {
 	log.Info("all endpoints synced random data successfully")
 
 	// upload test file
-	log.Info("uploading to " + endpoints[0] + " and syncing")
+	seed := int(time.Now().UnixNano() / 1e6)
+	log.Info("feed uploading to "+endpoints[0]+" and syncing", "seed", seed)
 
-	f, cleanup := generateRandomFile(filesize * 1000)
-	defer cleanup()
+	h = md5.New()
+	r := io.TeeReader(io.LimitReader(crand.Reader, int64(filesize*1000)), h)
 
-	hash, err := upload(f, endpoints[0])
+	hash, err := upload(r, filesize*1000, endpoints[0])
 	if err != nil {
 		return err
 	}
@@ -218,10 +215,7 @@ func cliFeedUploadAndSync(c *cli.Context) error {
 		return err
 	}
 	multihashHex := hexutil.Encode(hashBytes)
-	fileHash, err := digest(f)
-	if err != nil {
-		return err
-	}
+	fileHash := h.Sum(nil)
 
 	log.Info("uploaded successfully", "hash", hash, "digest", fmt.Sprintf("%x", fileHash))
 
@@ -279,40 +273,6 @@ func cliFeedUploadAndSync(c *cli.Context) error {
 	}
 	wg.Wait()
 	log.Info("all endpoints synced random file successfully")
-
-	return nil
-}
-
-func fetchFeed(topic string, user string, endpoint string, original []byte, ruid string) error {
-	log.Trace("sleeping", "ruid", ruid)
-	time.Sleep(3 * time.Second)
-
-	log.Trace("http get request (feed)", "ruid", ruid, "api", endpoint, "topic", topic, "user", user)
-	res, err := http.Get(endpoint + "/bzz-feed:/?topic=" + topic + "&user=" + user)
-	if err != nil {
-		return err
-	}
-	log.Trace("http get response (feed)", "ruid", ruid, "api", endpoint, "topic", topic, "user", user, "code", res.StatusCode, "len", res.ContentLength)
-
-	if res.StatusCode != 200 {
-		return fmt.Errorf("expected status code %d, got %v (ruid %v)", 200, res.StatusCode, ruid)
-	}
-
-	defer res.Body.Close()
-
-	rdigest, err := digest(res.Body)
-	if err != nil {
-		log.Warn(err.Error(), "ruid", ruid)
-		return err
-	}
-
-	if !bytes.Equal(rdigest, original) {
-		err := fmt.Errorf("downloaded imported file md5=%x is not the same as the generated one=%x", rdigest, original)
-		log.Warn(err.Error(), "ruid", ruid)
-		return err
-	}
-
-	log.Trace("downloaded file matches random file", "ruid", ruid, "len", res.ContentLength)
 
 	return nil
 }

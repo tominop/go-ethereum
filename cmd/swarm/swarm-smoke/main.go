@@ -17,12 +17,23 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"sort"
+
+	"github.com/ethereum/go-ethereum/cmd/utils"
+	gethmetrics "github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/metrics/influxdb"
+	swarmmetrics "github.com/ethereum/go-ethereum/swarm/metrics"
+	"github.com/ethereum/go-ethereum/swarm/tracing"
 
 	"github.com/ethereum/go-ethereum/log"
 
 	cli "gopkg.in/urfave/cli.v1"
+)
+
+var (
+	gitCommit string // Git SHA1 commit hash of the release (set via linker flags)
 )
 
 var (
@@ -32,9 +43,12 @@ var (
 	appName          string
 	scheme           string
 	filesize         int
+	syncDelay        int
 	from             int
 	to               int
 	verbosity        int
+	timeout          int
+	single           bool
 )
 
 func main() {
@@ -86,34 +100,104 @@ func main() {
 			Destination: &filesize,
 		},
 		cli.IntFlag{
+			Name:        "sync-delay",
+			Value:       5,
+			Usage:       "duration of delay in seconds to wait for content to be synced",
+			Destination: &syncDelay,
+		},
+		cli.IntFlag{
 			Name:        "verbosity",
 			Value:       1,
 			Usage:       "verbosity",
 			Destination: &verbosity,
 		},
+		cli.IntFlag{
+			Name:        "timeout",
+			Value:       120,
+			Usage:       "timeout in seconds after which kill the process",
+			Destination: &timeout,
+		},
+		cli.BoolFlag{
+			Name:        "single",
+			Usage:       "whether to fetch content from a single node or from all nodes",
+			Destination: &single,
+		},
 	}
+
+	app.Flags = append(app.Flags, []cli.Flag{
+		utils.MetricsEnabledFlag,
+		swarmmetrics.MetricsInfluxDBEndpointFlag,
+		swarmmetrics.MetricsInfluxDBDatabaseFlag,
+		swarmmetrics.MetricsInfluxDBUsernameFlag,
+		swarmmetrics.MetricsInfluxDBPasswordFlag,
+		swarmmetrics.MetricsInfluxDBTagsFlag,
+	}...)
+
+	app.Flags = append(app.Flags, tracing.Flags...)
 
 	app.Commands = []cli.Command{
 		{
 			Name:    "upload_and_sync",
 			Aliases: []string{"c"},
 			Usage:   "upload and sync",
-			Action:  cliUploadAndSync,
+			Action:  wrapCliCommand("upload-and-sync", true, uploadAndSync),
 		},
 		{
 			Name:    "feed_sync",
 			Aliases: []string{"f"},
 			Usage:   "feed update generate, upload and sync",
-			Action:  cliFeedUploadAndSync,
+			Action:  wrapCliCommand("feed-and-sync", true, feedUploadAndSync),
+		},
+		{
+			Name:    "upload_speed",
+			Aliases: []string{"u"},
+			Usage:   "measure upload speed",
+			Action:  wrapCliCommand("upload-speed", true, uploadSpeed),
+		},
+		{
+			Name:    "sliding_window",
+			Aliases: []string{"s"},
+			Usage:   "measure network aggregate capacity",
+			Action:  wrapCliCommand("sliding-window", false, slidingWindow),
 		},
 	}
 
 	sort.Sort(cli.FlagsByName(app.Flags))
 	sort.Sort(cli.CommandsByName(app.Commands))
 
+	app.Before = func(ctx *cli.Context) error {
+		tracing.Setup(ctx)
+		return nil
+	}
+
+	app.After = func(ctx *cli.Context) error {
+		return emitMetrics(ctx)
+	}
+
 	err := app.Run(os.Args)
 	if err != nil {
 		log.Error(err.Error())
+
 		os.Exit(1)
 	}
+}
+
+func emitMetrics(ctx *cli.Context) error {
+	if gethmetrics.Enabled {
+		var (
+			endpoint = ctx.GlobalString(swarmmetrics.MetricsInfluxDBEndpointFlag.Name)
+			database = ctx.GlobalString(swarmmetrics.MetricsInfluxDBDatabaseFlag.Name)
+			username = ctx.GlobalString(swarmmetrics.MetricsInfluxDBUsernameFlag.Name)
+			password = ctx.GlobalString(swarmmetrics.MetricsInfluxDBPasswordFlag.Name)
+			tags     = ctx.GlobalString(swarmmetrics.MetricsInfluxDBTagsFlag.Name)
+		)
+
+		tagsMap := utils.SplitTagsFlag(tags)
+		tagsMap["version"] = gitCommit
+		tagsMap["filesize"] = fmt.Sprintf("%v", filesize)
+
+		return influxdb.InfluxDBWithTagsOnce(gethmetrics.DefaultRegistry, endpoint, database, username, password, "swarm-smoke.", tagsMap)
+	}
+
+	return nil
 }

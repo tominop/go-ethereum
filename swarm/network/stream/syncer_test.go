@@ -18,11 +18,12 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
-	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,17 +37,16 @@ import (
 	"github.com/ethereum/go-ethereum/swarm/state"
 	"github.com/ethereum/go-ethereum/swarm/storage"
 	"github.com/ethereum/go-ethereum/swarm/storage/mock"
-	mockmem "github.com/ethereum/go-ethereum/swarm/storage/mock/mem"
 	"github.com/ethereum/go-ethereum/swarm/testutil"
 )
 
 const dataChunkCount = 200
 
 func TestSyncerSimulation(t *testing.T) {
-	testSyncBetweenNodes(t, 2, 1, dataChunkCount, true, 1)
-	testSyncBetweenNodes(t, 4, 1, dataChunkCount, true, 1)
-	testSyncBetweenNodes(t, 8, 1, dataChunkCount, true, 1)
-	testSyncBetweenNodes(t, 16, 1, dataChunkCount, true, 1)
+	testSyncBetweenNodes(t, 2, dataChunkCount, true, 1)
+	testSyncBetweenNodes(t, 4, dataChunkCount, true, 1)
+	testSyncBetweenNodes(t, 8, dataChunkCount, true, 1)
+	testSyncBetweenNodes(t, 16, dataChunkCount, true, 1)
 }
 
 func createMockStore(globalStore mock.GlobalStorer, id enode.ID, addr *network.BzzAddr) (lstore storage.ChunkStore, datadir string, err error) {
@@ -67,43 +67,18 @@ func createMockStore(globalStore mock.GlobalStorer, id enode.ID, addr *network.B
 	return lstore, datadir, nil
 }
 
-func testSyncBetweenNodes(t *testing.T, nodes, conns, chunkCount int, skipCheck bool, po uint8) {
+func testSyncBetweenNodes(t *testing.T, nodes, chunkCount int, skipCheck bool, po uint8) {
 
-	t.Skip("temporarily disabled as simulations.WaitTillHealthy cannot be trusted")
 	sim := simulation.New(map[string]simulation.ServiceFunc{
 		"streamer": func(ctx *adapters.ServiceContext, bucket *sync.Map) (s node.Service, cleanup func(), err error) {
-			var store storage.ChunkStore
-			var datadir string
-
-			node := ctx.Config.Node()
-			addr := network.NewAddr(node)
+			addr := network.NewAddr(ctx.Config.Node())
 			//hack to put addresses in same space
 			addr.OAddr[0] = byte(0)
 
-			if *useMockStore {
-				store, datadir, err = createMockStore(mockmem.NewGlobalStore(), node.ID(), addr)
-			} else {
-				store, datadir, err = createTestLocalStorageForID(node.ID(), addr)
-			}
+			netStore, delivery, clean, err := newNetStoreAndDeliveryWithBzzAddr(ctx, bucket, addr)
 			if err != nil {
 				return nil, nil, err
 			}
-			bucket.Store(bucketKeyStore, store)
-			cleanup = func() {
-				store.Close()
-				os.RemoveAll(datadir)
-			}
-			localStore := store.(*storage.LocalStore)
-			netStore, err := storage.NewNetStore(localStore, nil)
-			if err != nil {
-				return nil, nil, err
-			}
-			bucket.Store(bucketKeyDB, netStore)
-			kad := network.NewKademlia(addr.Over(), network.NewKadParams())
-			delivery := NewDelivery(kad, netStore)
-			netStore.NewNetFetcherFunc = network.NewFetcherFactory(delivery.RequestFromPeers, true).New
-
-			bucket.Store(bucketKeyDelivery, delivery)
 
 			r := NewRegistry(addr.ID(), delivery, netStore, state.NewInmemoryStore(), &RegistryOptions{
 				Retrieval: RetrievalDisabled,
@@ -111,11 +86,12 @@ func testSyncBetweenNodes(t *testing.T, nodes, conns, chunkCount int, skipCheck 
 				SkipCheck: skipCheck,
 			}, nil)
 
-			fileStore := storage.NewFileStore(netStore, storage.NewFileStoreParams())
-			bucket.Store(bucketKeyFileStore, fileStore)
+			cleanup = func() {
+				r.Close()
+				clean()
+			}
 
 			return r, cleanup, nil
-
 		},
 	})
 	defer sim.Close()
@@ -130,7 +106,7 @@ func testSyncBetweenNodes(t *testing.T, nodes, conns, chunkCount int, skipCheck 
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := sim.Run(ctx, func(ctx context.Context, sim *simulation.Simulation) error {
+	result := sim.Run(ctx, func(ctx context.Context, sim *simulation.Simulation) (err error) {
 		nodeIDs := sim.UpNodeIDs()
 
 		nodeIndex := make(map[enode.ID]int)
@@ -144,11 +120,19 @@ func testSyncBetweenNodes(t *testing.T, nodes, conns, chunkCount int, skipCheck 
 			simulation.NewPeerEventsFilter().Drop(),
 		)
 
+		var disconnected atomic.Value
 		go func() {
 			for d := range disconnections {
 				if d.Error != nil {
 					log.Error("peer drop", "node", d.NodeID, "peer", d.PeerID)
-					t.Fatal(d.Error)
+					disconnected.Store(true)
+				}
+			}
+		}()
+		defer func() {
+			if err != nil {
+				if yes, ok := disconnected.Load().(bool); ok && yes {
+					err = errors.New("disconnect events received")
 				}
 			}
 		}()
@@ -180,7 +164,7 @@ func testSyncBetweenNodes(t *testing.T, nodes, conns, chunkCount int, skipCheck 
 			}
 		}
 		// here we distribute chunks of a random file into stores 1...nodes
-		if _, err := sim.WaitTillHealthy(ctx, 2); err != nil {
+		if _, err := sim.WaitTillHealthy(ctx); err != nil {
 			return err
 		}
 
@@ -242,44 +226,26 @@ func TestSameVersionID(t *testing.T) {
 	v := uint(1)
 	sim := simulation.New(map[string]simulation.ServiceFunc{
 		"streamer": func(ctx *adapters.ServiceContext, bucket *sync.Map) (s node.Service, cleanup func(), err error) {
-			var store storage.ChunkStore
-			var datadir string
-
-			node := ctx.Config.Node()
-			addr := network.NewAddr(node)
-
-			store, datadir, err = createTestLocalStorageForID(node.ID(), addr)
+			addr, netStore, delivery, clean, err := newNetStoreAndDelivery(ctx, bucket)
 			if err != nil {
 				return nil, nil, err
 			}
-			bucket.Store(bucketKeyStore, store)
-			cleanup = func() {
-				store.Close()
-				os.RemoveAll(datadir)
-			}
-			localStore := store.(*storage.LocalStore)
-			netStore, err := storage.NewNetStore(localStore, nil)
-			if err != nil {
-				return nil, nil, err
-			}
-			bucket.Store(bucketKeyDB, netStore)
-			kad := network.NewKademlia(addr.Over(), network.NewKadParams())
-			delivery := NewDelivery(kad, netStore)
-			netStore.NewNetFetcherFunc = network.NewFetcherFactory(delivery.RequestFromPeers, true).New
-
-			bucket.Store(bucketKeyDelivery, delivery)
 
 			r := NewRegistry(addr.ID(), delivery, netStore, state.NewInmemoryStore(), &RegistryOptions{
 				Retrieval: RetrievalDisabled,
 				Syncing:   SyncingAutoSubscribe,
 			}, nil)
+			bucket.Store(bucketKeyRegistry, r)
+
 			//assign to each node the same version ID
 			r.spec.Version = v
 
-			bucket.Store(bucketKeyRegistry, r)
+			cleanup = func() {
+				r.Close()
+				clean()
+			}
 
 			return r, cleanup, nil
-
 		},
 	})
 	defer sim.Close()
@@ -324,46 +290,27 @@ func TestDifferentVersionID(t *testing.T) {
 	v := uint(0)
 	sim := simulation.New(map[string]simulation.ServiceFunc{
 		"streamer": func(ctx *adapters.ServiceContext, bucket *sync.Map) (s node.Service, cleanup func(), err error) {
-			var store storage.ChunkStore
-			var datadir string
-
-			node := ctx.Config.Node()
-			addr := network.NewAddr(node)
-
-			store, datadir, err = createTestLocalStorageForID(node.ID(), addr)
+			addr, netStore, delivery, clean, err := newNetStoreAndDelivery(ctx, bucket)
 			if err != nil {
 				return nil, nil, err
 			}
-			bucket.Store(bucketKeyStore, store)
-			cleanup = func() {
-				store.Close()
-				os.RemoveAll(datadir)
-			}
-			localStore := store.(*storage.LocalStore)
-			netStore, err := storage.NewNetStore(localStore, nil)
-			if err != nil {
-				return nil, nil, err
-			}
-			bucket.Store(bucketKeyDB, netStore)
-			kad := network.NewKademlia(addr.Over(), network.NewKadParams())
-			delivery := NewDelivery(kad, netStore)
-			netStore.NewNetFetcherFunc = network.NewFetcherFactory(delivery.RequestFromPeers, true).New
-
-			bucket.Store(bucketKeyDelivery, delivery)
 
 			r := NewRegistry(addr.ID(), delivery, netStore, state.NewInmemoryStore(), &RegistryOptions{
 				Retrieval: RetrievalDisabled,
 				Syncing:   SyncingAutoSubscribe,
 			}, nil)
+			bucket.Store(bucketKeyRegistry, r)
 
 			//increase the version ID for each node
 			v++
 			r.spec.Version = v
 
-			bucket.Store(bucketKeyRegistry, r)
+			cleanup = func() {
+				r.Close()
+				clean()
+			}
 
 			return r, cleanup, nil
-
 		},
 	})
 	defer sim.Close()
